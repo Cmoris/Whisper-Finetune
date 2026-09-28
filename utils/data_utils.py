@@ -40,12 +40,17 @@ def to_simple(text: str or List[str]):
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
     processor: Any
+    decoder_start_token_id: int = None
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
         # split inputs and labels since they have to be of different lengths and need different padding methods
         # first treat the audio inputs by simply returning torch tensors
-        input_features = [{"input_features": feature["input_features"][0]} for feature in features]
-        batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
+        input_name = self.processor.feature_extractor.model_input_names[0]
+        input_features = [{input_name: feature[input_name][0]} for feature in features]
+        # Moonshine 使用变长原始波形，需要 mask 区分真实音频与 padding。
+        padding_kwargs = {"return_attention_mask": True} if input_name == "input_values" else {}
+        batch = self.processor.feature_extractor.pad(
+            input_features, return_tensors="pt", **padding_kwargs)
 
         # get the tokenized label sequences
         label_features = [{"input_ids": feature["labels"]} for feature in features]
@@ -57,7 +62,10 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
         # if bos token is appended in previous tokenization step,
         # cut bos token here as it's append later anyways
-        if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all().cpu().item():
+        start_token_id = self.decoder_start_token_id
+        if start_token_id is None:
+            start_token_id = self.processor.tokenizer.bos_token_id
+        if labels.shape[1] and start_token_id is not None and (labels[:, 0] == start_token_id).all().cpu().item():
             labels = labels[:, 1:]
 
         batch["labels"] = labels

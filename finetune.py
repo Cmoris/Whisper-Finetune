@@ -4,19 +4,39 @@ import os
 import platform
 
 from peft import LoraConfig, get_peft_model, AdaLoraConfig, PeftModel, prepare_model_for_kbit_training
-from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments, WhisperForConditionalGeneration, WhisperProcessor
+from transformers import (AutoModelForSpeechSeq2Seq, AutoProcessor, BitsAndBytesConfig,
+                          Seq2SeqTrainer, Seq2SeqTrainingArguments,
+                          WhisperForConditionalGeneration, WhisperProcessor)
 
 from utils.callback import SavePeftModelCallback
 from utils.data_utils import DataCollatorSpeechSeq2SeqWithPadding
 from utils.model_utils import load_from_checkpoint
-from utils.reader import CustomDataset
-from utils.utils import print_arguments, make_inputs_require_grad, add_arguments
+from utils.reader import CustomDataset, DistillWhisperDataset, MoonshineDataset
+from utils.utils import print_arguments, add_arguments
+
+
+MODEL_DEFAULTS = {
+    "whisper": "openai/whisper-tiny",
+    "distill_whisper": "distil-whisper/distil-small.en",
+    "moonshine": "UsefulSensors/moonshine-tiny",
+}
+DATASET_CLASSES = {
+    "whisper": CustomDataset,
+    "distill_whisper": DistillWhisperDataset,
+    "moonshine": MoonshineDataset,
+}
+DATASET_ALIASES = {cls.__name__: name for name, cls in DATASET_CLASSES.items()}
 
 parser = argparse.ArgumentParser(description=__doc__)
 add_arg = functools.partial(add_arguments, argparser=parser)
 add_arg("train_data",    type=str, default="dataset/train.json",       help="训练数据集的路径")
 add_arg("test_data",     type=str, default="dataset/test.json",        help="测试数据集的路径")
-add_arg("base_model",    type=str, default="openai/whisper-tiny",      help="Whisper的基础模型")
+add_arg("model_type", type=str, default="whisper", choices=list(MODEL_DEFAULTS),
+        help="模型类型；Distill-Whisper 使用 Whisper 架构")
+add_arg("dataset_type", type=str, default="auto",
+        choices=["auto", *DATASET_CLASSES, *DATASET_ALIASES],
+        help="数据集类型或 reader.py 中的类名；auto 根据 model_type 选择")
+add_arg("base_model", type=str, default=None, help="基础模型的 Hugging Face ID 或本地目录；默认根据 model_type 选择")
 add_arg("output_dir",    type=str, default="output/",                  help="训练保存模型的路径")
 add_arg("warmup_steps",  type=int, default=50,      help="训练预热步数")
 add_arg("logging_steps", type=int, default=100,     help="打印日志步数")
@@ -43,58 +63,93 @@ add_arg("gradient_accumulation_steps", type=int, default=1,    help="梯度累�
 add_arg("push_to_hub",                 type=bool, default=False, help="是否将模型权重推到HuggingFace Hub")
 add_arg("hub_model_id",                type=str,  default=None,  help="HuggingFace Hub上的模型仓库ID")
 add_arg("save_total_limit",            type=int,  default=10,  help="只保存最新检查点的数量")
-args = parser.parse_args()
-print_arguments(args)
-
-# 如果是Windows，num_workers设置为0
-if platform.system() == "Windows":
-    args.num_workers = 0
 
 
-def main():
-    # 获取Whisper的数据处理器，这个包含了特征提取器、tokenizer
-    processor = WhisperProcessor.from_pretrained(args.base_model,
-                                                 language=args.language,
-                                                 task=args.task,
-                                                 no_timestamps=not args.timestamps,
-                                                 local_files_only=args.local_files_only)
+def parse_args(argv=None):
+    args = parser.parse_args(argv)
+    args.base_model = args.base_model or MODEL_DEFAULTS[args.model_type]
+    args.dataset_type = DATASET_ALIASES.get(args.dataset_type, args.dataset_type)
+    if args.dataset_type == "auto":
+        args.dataset_type = args.model_type
+    # Whisper 与 Distill-Whisper 的特征格式相同，Moonshine 则使用原始波形。
+    if (args.model_type == "moonshine") != (args.dataset_type == "moonshine"):
+        parser.error("Moonshine 模型必须搭配 MoonshineDataset；Whisper 模型不能使用该数据集")
+    if args.model_type == "moonshine" and (args.timestamps or args.task != "transcribe"):
+        parser.error("Moonshine 不支持 timestamps=True 或 task=translate")
+    if platform.system() == "Windows":
+        args.num_workers = 0
+    return args
+
+
+def load_processor(args):
+    if args.model_type == "moonshine":
+        processor = AutoProcessor.from_pretrained(
+            args.base_model, local_files_only=args.local_files_only)
+        processor.tokenizer.pad_token = "</s>"
+        processor.tokenizer.eos_token = "</s>"
+        processor.tokenizer.bos_token = "<s>"
+        return processor
+    # Distill-Whisper 也使用 Whisper tokenizer 和 log-Mel 特征。
+    return WhisperProcessor.from_pretrained(
+        args.base_model, language=args.language, task=args.task,
+        no_timestamps=not args.timestamps, local_files_only=args.local_files_only)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    print_arguments(args)
+    processor = load_processor(args)
 
     # 读取数据
-    train_dataset = CustomDataset(data_list_path=args.train_data,
+    dataset_class = DATASET_CLASSES[args.dataset_type]
+    train_dataset = dataset_class(data_list_path=args.train_data,
                                   processor=processor,
                                   language=args.language,
                                   timestamps=args.timestamps,
                                   min_duration=args.min_audio_len,
                                   max_duration=args.max_audio_len,
                                   augment_config_path=args.augment_config_path)
-    test_dataset = CustomDataset(data_list_path=args.test_data,
+    test_dataset = dataset_class(data_list_path=args.test_data,
                                  processor=processor,
                                  language=args.language,
                                  timestamps=args.timestamps,
                                  min_duration=args.min_audio_len,
                                  max_duration=args.max_audio_len)
     print(f"训练数据：{len(train_dataset)}，测试数据：{len(test_dataset)}")
-    # 数据padding器
-    data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor)
+    if not len(train_dataset) or not len(test_dataset):
+        raise ValueError("训练集或测试集为空，请检查路径和音频时长过滤条件")
 
-    # 获取Whisper模型
+    # 配置模型加载设备
     device_map = "auto"
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     ddp = world_size != 1
     if ddp:
         device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
 
-    # 获取模型
-    model = WhisperForConditionalGeneration.from_pretrained(args.base_model,
-                                                            load_in_8bit=args.use_8bit,
-                                                            device_map=device_map,
-                                                            local_files_only=args.local_files_only)
-    model.config.forced_decoder_ids = None
-    model.config.suppress_tokens = []
-    # 量化模型
-    model = prepare_model_for_kbit_training(model)
-    # 注册forward，否则多卡训练会失败
-    model.model.encoder.conv1.register_forward_hook(make_inputs_require_grad)
+    # AutoModel 根据配置加载 Distill-Whisper / Moonshine，不依赖模型路径命名。
+    model_class = (WhisperForConditionalGeneration if args.model_type == "whisper"
+                   else AutoModelForSpeechSeq2Seq)
+    model_kwargs = dict(device_map=device_map, local_files_only=args.local_files_only)
+    if args.use_8bit:
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+    model = model_class.from_pretrained(args.base_model, **model_kwargs)
+    expected_architecture = "moonshine" if args.model_type == "moonshine" else "whisper"
+    if model.config.model_type != expected_architecture:
+        raise ValueError(f"--model_type {args.model_type} 与模型架构 {model.config.model_type} 不匹配")
+    if args.model_type != "moonshine":
+        model.config.forced_decoder_ids = None
+        model.config.suppress_tokens = []
+        model.generation_config.forced_decoder_ids = None
+        model.generation_config.suppress_tokens = []
+    else:
+        model.config.pad_token_id = processor.tokenizer.pad_token_id
+        model.generation_config.pad_token_id = processor.tokenizer.pad_token_id
+
+    data_collator = DataCollatorSpeechSeq2SeqWithPadding(
+        processor=processor, decoder_start_token_id=model.config.decoder_start_token_id)
+    # 未启用梯度检查点，不需要依赖 Whisper encoder.conv1 的输入梯度 hook。
+    if args.use_8bit:
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
 
     print('加载LoRA模块...')
     if args.resume_from_checkpoint:
@@ -103,7 +158,12 @@ def main():
         model = PeftModel.from_pretrained(model, args.resume_from_checkpoint, is_trainable=True)
     else:
         print(f'adding LoRA modules...')
-        target_modules = ["k_proj", "q_proj", "v_proj", "out_proj", "fc1", "fc2"]
+        module_names = {name.rsplit(".", 1)[-1] for name, _ in model.named_modules()}
+        target_modules = [name for name in
+                          ["k_proj", "q_proj", "v_proj", "out_proj", "o_proj", "fc1", "fc2"]
+                          if name in module_names]
+        if not target_modules:
+            raise ValueError("模型中未找到支持的 LoRA 目标层")
         print(target_modules)
         if args.use_adalora:
             total_step = args.num_train_epochs * len(train_dataset)
@@ -155,7 +215,7 @@ def main():
                              train_dataset=train_dataset,
                              eval_dataset=test_dataset,
                              data_collator=data_collator,
-                             processing_class=processor.feature_extractor,
+                             processing_class=processor,
                              callbacks=[SavePeftModelCallback])
     model.config.use_cache = False
     trainer._load_from_checkpoint = load_from_checkpoint
@@ -169,6 +229,7 @@ def main():
     model.config.use_cache = True
     if training_args.local_rank == 0 or training_args.local_rank == -1:
         model.save_pretrained(os.path.join(output_dir, "checkpoint-final"))
+        processor.save_pretrained(os.path.join(output_dir, "checkpoint-final"))
     # 是否把模型参数文件推送到huggingface
     if training_args.push_to_hub:
         hub_model_id = args.hub_model_id if args.hub_model_id is not None else output_dir
