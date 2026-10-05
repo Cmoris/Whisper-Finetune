@@ -1,9 +1,9 @@
 CUDA_VISIBLE_DEVICES=2 python evaluation.py \
-    --model_path openai/whisper-base \
-    --base_model openai/whisper-base \
+    --model_path openai/whisper-large-v2 \
+    --base_model openai/whisper-large-v2 \
     --lora_enable False \
     --test_data dataset/testset/LibriSpeech \
-    --batch_size 16 \
+    --batch_size 4 \
     --num_workers 8 \
     --language en \
     --metric wer \
@@ -13,4 +13,4 @@ CUDA_VISIBLE_DEVICES=2 python evaluation.py \
     --local_files_only False \
     --remove_pun True \
     --timestamps False \
-    --result_path ./results/results_openai/whisper-base.jsonl
+    --result_path ./results/results_openai/whisper-large-v2.jsonl

@@ -10,7 +10,56 @@ import soundfile
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from utils.binary import DatasetReader
+def resolve_data_list_paths(data_list_path):
+    """将文件、目录或它们的列表展开为文件列表；目录仅扫描当前层。"""
+    if isinstance(data_list_path, (str, os.PathLike)):
+        paths = [data_list_path]
+    elif isinstance(data_list_path, (list, tuple)):
+        paths = data_list_path
+    else:
+        raise TypeError("data_list_path必须为文件/目录路径或路径列表")
+
+    resolved_paths = []
+    for path in paths:
+        if not isinstance(path, (str, os.PathLike)):
+            raise TypeError("data_list_path列表中的元素必须为文件/目录路径")
+        path = os.fspath(path)
+        if os.path.isdir(path):
+            files = sorted(
+                os.path.join(path, name) for name in os.listdir(path)
+                if name.lower().endswith((".json", ".jsonl"))
+                and os.path.isfile(os.path.join(path, name))
+            )
+            if not files:
+                raise ValueError(f"数据目录中没有 JSON/JSONL 数据列表文件：{path}")
+            resolved_paths.extend(files)
+        else:
+            resolved_paths.append(path)
+    return resolved_paths
+
+
+def load_data_list(data_list_path, min_duration, max_duration, min_sentence, max_sentence):
+    """读取文件、目录或路径列表中的逐行 JSON 数据，合并并过滤。"""
+    paths = resolve_data_list_paths(data_list_path)
+    data_list = []
+    for path in paths:
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in tqdm(f, desc='读取数据列表'):
+                line = json.loads(line)
+                if not isinstance(line, dict):
+                    continue
+                if line["duration"] < min_duration:
+                    continue
+                if max_duration != -1 and line["duration"] > max_duration:
+                    continue
+                if 'sentence' in line:
+                    sentence_len = len(line["sentence"])
+                else:
+                    sentence_len = sum(len(s['text']) for s in line["sentences"])
+                if sentence_len < min_sentence or sentence_len > max_sentence:
+                    continue
+                data_list.append(dict(line))
+    return data_list
 
 
 class CustomDataset(Dataset):
@@ -28,7 +77,7 @@ class CustomDataset(Dataset):
                  augment_config_path=None):
         """
         Args:
-            data_list_path: 数据列表文件的路径，或者二进制列表的头文件路径
+            data_list_path: 逐行 JSON/JSONL 文件、包含这些文件的目录，或文件/目录路径列表
             processor: Whisper的预处理工具，WhisperProcessor.from_pretrained获取
             mono: 是否将音频转换成单通道，这个必须是True
             language: 微调数据的语言
@@ -47,7 +96,6 @@ class CustomDataset(Dataset):
         assert max_sentence <= 200, f"max_sentence不能大于200，当前为：{max_sentence}"
         self.data_list_path = data_list_path
         self.processor = processor
-        self.data_list_path = data_list_path
         self.sample_rate = sample_rate
         self.mono = mono
         self.language = language
@@ -79,44 +127,12 @@ class CustomDataset(Dataset):
 
     # 加载数据列表
     def _load_data_list(self):
-        if self.data_list_path.endswith(".header"):
-            # 获取二进制的数据列表
-            self.dataset_reader = DatasetReader(data_header_path=self.data_list_path,
-                                                min_duration=self.min_duration,
-                                                max_duration=self.max_duration)
-            self.data_list = self.dataset_reader.get_keys()
-        else:
-            # 获取数据列表
-            with open(self.data_list_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-            self.data_list = []
-            for line in tqdm(lines, desc='读取数据列表'):
-                if isinstance(line, str):
-                    line = json.loads(line)
-                if not isinstance(line, dict): continue
-                # 跳过超出长度限制的音频
-                if line["duration"] < self.min_duration:
-                    continue
-                if self.max_duration != -1 and line["duration"] > self.max_duration:
-                    continue
-                # 跳过超出句子字数限制的音频
-                if 'sentence' in line.keys():
-                    if len(line["sentence"]) < self.min_sentence or len(line["sentence"]) > self.max_sentence:
-                        continue
-                else:
-                    sentence_len = 0
-                    for s in line["sentences"]:
-                        sentence_len += len(s['text'])
-                    if sentence_len < self.min_sentence or sentence_len > self.max_sentence:
-                        continue
-                self.data_list.append(dict(line))
+        self.data_list = load_data_list(self.data_list_path, self.min_duration,
+                                        self.max_duration, self.min_sentence, self.max_sentence)
 
     # 从数据列表里面获取音频数据、采样率和文本
     def _get_list_data(self, idx):
-        if self.data_list_path.endswith(".header"):
-            data_list = self.dataset_reader.get_data(self.data_list[idx])
-        else:
-            data_list = self.data_list[idx]
+        data_list = self.data_list[idx]
         # 分割音频路径和标签
         audio_file = data_list["audio"]['path']
         transcript = data_list["sentences"] if self.timestamps else data_list["sentence"]
@@ -349,7 +365,7 @@ class MoonshineDataset(Dataset):
                  augment_config_path=None):
         """
         Args:
-            data_list_path: 数据列表文件的路径，或者二进制列表的头文件路径
+            data_list_path: 逐行 JSON/JSONL 文件、包含这些文件的目录，或文件/目录路径列表
             processor: Whisper的预处理工具，WhisperProcessor.from_pretrained获取
             mono: 是否将音频转换成单通道，这个必须是True
             language: 微调数据的语言
@@ -364,7 +380,6 @@ class MoonshineDataset(Dataset):
         super().__init__()
         self.data_list_path = data_list_path
         self.processor = processor
-        self.data_list_path = data_list_path
         self.sample_rate = sample_rate
         self.mono = mono
         self.language = language
@@ -389,46 +404,15 @@ class MoonshineDataset(Dataset):
         if augment_config_path:
             with open(augment_config_path, 'r', encoding='utf-8') as f:
                 self.augment_configs = json.load(f)
-        # 加载数据列表
+
+    # 加载数据列表
     def _load_data_list(self):
-        if self.data_list_path.endswith(".header"):
-            # 获取二进制的数据列表
-            self.dataset_reader = DatasetReader(data_header_path=self.data_list_path,
-                                                min_duration=self.min_duration,
-                                                max_duration=self.max_duration)
-            self.data_list = self.dataset_reader.get_keys()
-        else:
-            # 获取数据列表
-            with open(self.data_list_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-            self.data_list = []
-            for line in tqdm(lines, desc='读取数据列表'):
-                if isinstance(line, str):
-                    line = json.loads(line)
-                if not isinstance(line, dict): continue
-                # 跳过超出长度限制的音频
-                if line["duration"] < self.min_duration:
-                    continue
-                if self.max_duration != -1 and line["duration"] > self.max_duration:
-                    continue
-                # 跳过超出句子字数限制的音频
-                if 'sentence' in line.keys():
-                    if len(line["sentence"]) < self.min_sentence or len(line["sentence"]) > self.max_sentence:
-                        continue
-                else:
-                    sentence_len = 0
-                    for s in line["sentences"]:
-                        sentence_len += len(s['text'])
-                    if sentence_len < self.min_sentence or sentence_len > self.max_sentence:
-                        continue
-                self.data_list.append(dict(line))
+        self.data_list = load_data_list(self.data_list_path, self.min_duration,
+                                        self.max_duration, self.min_sentence, self.max_sentence)
 
     # 从数据列表里面获取音频数据、采样率和文本
     def _get_list_data(self, idx):
-        if self.data_list_path.endswith(".header"):
-            data_list = self.dataset_reader.get_data(self.data_list[idx])
-        else:
-            data_list = self.data_list[idx]
+        data_list = self.data_list[idx]
         # 分割音频路径和标签
         audio_file = data_list["audio"]['path']
         transcript = data_list["sentences"] if self.timestamps else data_list["sentence"]
