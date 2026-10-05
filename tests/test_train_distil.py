@@ -2,8 +2,8 @@
 
 import tempfile
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
@@ -11,7 +11,7 @@ from transformers import Seq2SeqTrainingArguments, WhisperConfig, WhisperForCond
 from transformers.utils import is_accelerate_available
 
 from model.transformer import TransformerConfig, TransformerForConditionalGeneration
-from train_distil import DistillationTrainer, distillation_loss, parse_args
+from train_distil import DistillationTrainer, build_student, distillation_loss, parse_args
 
 
 class DistillationTests(unittest.TestCase):
@@ -77,14 +77,67 @@ class DistillationTests(unittest.TestCase):
         for option in ("--lambda", "--loss_lambda", "--alpha"):
             self.assertEqual(parse_args([option, "0.3"]).loss_lambda, 0.3)
 
+    def test_build_pretrained_students_and_resume(self):
+        custom, teacher = self.make_models()
+        processor = SimpleNamespace(
+            tokenizer=SimpleNamespace(get_vocab=lambda: {str(i): i for i in range(16)}),
+            feature_extractor=SimpleNamespace(feature_size=4),
+        )
+        for original in (custom, WhisperForConditionalGeneration(teacher.config)):
+            with self.subTest(model_type=original.config.model_type), tempfile.TemporaryDirectory() as checkpoint:
+                original.save_pretrained(checkpoint)
+                args = parse_args(["--student_model", checkpoint, "--local_files_only", "True"])
+                with patch("train_distil.WhisperProcessor.from_pretrained", return_value=processor):
+                    loaded = build_student(args, teacher.config, processor)
+                    self.assertIsInstance(loaded, type(original))
+                    for key, value in original.state_dict().items():
+                        torch.testing.assert_close(loaded.state_dict()[key], value)
+                    # Resume architecture takes priority over a different student ID.
+                    args.resume_from_checkpoint = checkpoint
+                    args.student_model = "unused/model-id"
+                    resumed = build_student(args, teacher.config, processor)
+                    self.assertIsInstance(resumed, type(original))
+
+                batch = dict(input_features=torch.randn(2, 4, 8),
+                             labels=torch.tensor([[3, 2, -100], [4, 5, 2]]))
+                context = SimpleNamespace(teacher_model=teacher, loss_lambda=0.5, temperature=1.5)
+                loss = DistillationTrainer.compute_loss(context, loaded, batch)
+                self.assertTrue(torch.isfinite(loss))
+                loss.backward()
+                self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0
+                                    for p in loaded.parameters()))
+                self.assertTrue(all(p.grad is None for p in teacher.parameters()))
+
+    def test_reject_incompatible_student_before_loading_weights(self):
+        _, teacher = self.make_models()
+        config = WhisperConfig(**teacher.config.to_dict())
+        config.num_mel_bins = 128
+        args = parse_args(["--student_model", "openai/whisper-small"])
+        with patch("train_distil.AutoConfig.from_pretrained", return_value=config), \
+                patch("train_distil.AutoModelForSpeechSeq2Seq.from_pretrained") as load:
+            with self.assertRaisesRegex(ValueError, "num_mel_bins"):
+                build_student(args, teacher.config, None)
+            load.assert_not_called()
+
+    def test_reject_student_token_id_mismatch(self):
+        _, teacher = self.make_models()
+        processor = SimpleNamespace(tokenizer=SimpleNamespace(get_vocab=lambda: {"a": 3, "b": 4}))
+        other = SimpleNamespace(tokenizer=SimpleNamespace(get_vocab=lambda: {"a": 4, "b": 3}))
+        args = parse_args(["--student_model", "openai/whisper-small"])
+        with patch("train_distil.AutoConfig.from_pretrained", return_value=teacher.config), \
+                patch("train_distil.WhisperProcessor.from_pretrained", return_value=other), \
+                patch("train_distil.AutoModelForSpeechSeq2Seq.from_pretrained") as load:
+            with self.assertRaisesRegex(ValueError, "token-ID"):
+                build_student(args, teacher.config, processor)
+            load.assert_not_called()
+
     @unittest.skipUnless(is_accelerate_available(), "Trainer integration requires accelerate")
     def test_training_evaluation_save_and_resume(self):
         student, teacher = self.make_models()
         data = [dict(input_features=torch.randn(4, 8), labels=torch.tensor([3, 2, -100]))
                 for _ in range(4)]
-        workspace_output = Path(__file__).resolve().parents[1] / "output"
-        workspace_output.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=workspace_output) as output_dir:
+        # Keep test checkpoints off the NFS workspace to avoid cleanup races.
+        with tempfile.TemporaryDirectory(dir="/tmp") as output_dir:
             args = Seq2SeqTrainingArguments(
                 output_dir=output_dir, use_cpu=True, report_to="none", max_steps=1,
                 per_device_train_batch_size=1, gradient_accumulation_steps=2,

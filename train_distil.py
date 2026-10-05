@@ -1,12 +1,15 @@
-"""Distil a Whisper teacher into the local audio Transformer.
+"""Distil a Whisper teacher into a pretrained Whisper or local audio Transformer.
 
 Example::
 
     python train_distil.py --teacher_model openai/whisper-small --lambda 0.5
+    python train_distil.py --teacher_model openai/whisper-large-v2 --student_model openai/whisper-small
 
 Loss = lambda * student_cross_entropy + (1 - lambda) * temperature_scaled_KL.
 
-Student weights are initialized randomly unless --student_model is supplied.
+Without --student_model, the local Transformer is initialized randomly.
+With --student_model, load pretrained weights and auto-detect the architecture.
+Teacher/student token-ID mappings and Mel feature dimensions must match.
 Use --resume_from_checkpoint to restore Trainer/optimizer/scheduler state.
 """
 
@@ -18,6 +21,7 @@ import platform
 import torch
 import torch.nn.functional as F
 from transformers import (
+    AutoConfig, AutoModelForSpeechSeq2Seq,
     Seq2SeqTrainer, Seq2SeqTrainingArguments, WhisperForConditionalGeneration,
     WhisperProcessor, set_seed,
 )
@@ -81,7 +85,7 @@ def parse_args(argv=None):
         ("test_data", "dataset/test.json", "验证数据列表"),
         ("teacher_model", "openai/whisper-small", "Whisper 教师模型 ID 或完整模型目录"),
         ("teacher_adapter", None, "教师的可选 LoRA/AdaLoRA 适配器目录"),
-        ("student_model", None, "已有学生模型目录；默认从头训练"),
+        ("student_model", None, "Whisper/Distil-Whisper 模型 ID 或本地 Whisper/Transformer 目录；默认随机初始化 Transformer"),
         ("output_dir", "output/distillation", "输出目录"),
         ("language", "Chinese", "语言，None 表示多语言"),
         ("task", "transcribe", "transcribe 或 translate"),
@@ -129,15 +133,16 @@ def parse_args(argv=None):
 
 
 def build_student(args, teacher_config, processor):
+    """Load a compatible pretrained student, or build the original Transformer."""
     # Resume also restores architecture; CLI size defaults must not override it.
     checkpoint = args.resume_from_checkpoint or args.student_model
     if checkpoint:
-        student = TransformerForConditionalGeneration.from_pretrained(
+        config = AutoConfig.from_pretrained(
             checkpoint, local_files_only=args.local_files_only)
-        student_processor = WhisperProcessor.from_pretrained(
-            checkpoint, local_files_only=args.local_files_only)
-        if student_processor.tokenizer.get_vocab() != processor.tokenizer.get_vocab():
-            raise ValueError("学生检查点与教师的 token-ID 映射不一致")
+        if config.model_type not in ("whisper", TransformerConfig.model_type):
+            raise ValueError(
+                f"不支持的学生架构：{config.model_type}；仅支持 Whisper/Distil-Whisper "
+                f"和本地 {TransformerConfig.model_type} Transformer")
     else:
         config = TransformerConfig(
             vocab_size=teacher_config.vocab_size,
@@ -157,15 +162,34 @@ def build_student(args, teacher_config, processor):
             eos_token_id=teacher_config.eos_token_id,
             decoder_start_token_id=teacher_config.decoder_start_token_id,
         )
-        student = TransformerForConditionalGeneration(config)
+    # Validate before allocating pretrained weights (potentially several GB).
     for name in ("vocab_size", "num_mel_bins", "pad_token_id", "bos_token_id",
                  "eos_token_id", "decoder_start_token_id"):
-        if getattr(student.config, name) != getattr(teacher_config, name):
-            raise ValueError(f"学生与教师的 {name} 不一致")
-    if max(processor.tokenizer.get_vocab().values()) >= student.config.vocab_size:
+        if getattr(config, name) != getattr(teacher_config, name):
+            raise ValueError(
+                f"学生与教师的 {name} 不一致：学生={getattr(config, name)}，"
+                f"教师={getattr(teacher_config, name)}。当前蒸馏要求共享词表和音频特征；"
+                "例如 whisper-small 可搭配 whisper-large-v2，不能直接搭配 whisper-large-v3。")
+    if max(processor.tokenizer.get_vocab().values()) >= config.vocab_size:
         raise ValueError("教师词表大小不足以容纳 processor 的 token ID")
-    if processor.feature_extractor.feature_size != student.config.num_mel_bins:
+    if processor.feature_extractor.feature_size != config.num_mel_bins:
         raise ValueError("音频特征维度与模型不一致")
+    if checkpoint:
+        student_processor = WhisperProcessor.from_pretrained(
+            checkpoint, local_files_only=args.local_files_only)
+        if student_processor.tokenizer.get_vocab() != processor.tokenizer.get_vocab():
+            raise ValueError("学生检查点与教师的 token-ID 映射不一致")
+        if student_processor.feature_extractor.feature_size != config.num_mel_bins:
+            raise ValueError("学生 processor 的音频特征维度与模型不一致")
+        student = AutoModelForSpeechSeq2Seq.from_pretrained(
+            checkpoint, config=config, local_files_only=args.local_files_only)
+    else:
+        student = TransformerForConditionalGeneration(config)
+    if config.model_type == "whisper":
+        # Whisper's encoder sinusoidal positions are fixed. Some Transformers
+        # loaders lose requires_grad=False; restore it for stable optimizer groups
+        # across initialization and checkpoint resume.
+        student.model.encoder.embed_positions.requires_grad_(False)
     return student
 
 
@@ -199,7 +223,8 @@ def main(argv=None):
             raise ValueError(f"数据集为空，请检查路径及过滤条件：{path}")
         datasets.append(dataset)
     print(f"训练数据：{len(datasets[0])}，验证数据：{len(datasets[1])}")
-    print(f"学生参数：{sum(p.numel() for p in student.parameters()):,}")
+    print(f"学生架构：{student.config.model_type}，"
+          f"学生参数：{sum(p.numel() for p in student.parameters()):,}")
     training_args = Seq2SeqTrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.per_device_train_batch_size,
