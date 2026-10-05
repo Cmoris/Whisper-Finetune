@@ -1,0 +1,16 @@
+CUDA_VISIBLE_DEVICES=2 python evaluation.py \
+    --model_path openai/whisper-base \
+    --base_model openai/whisper-base \
+    --lora_enable False \
+    --test_data dataset/testset/LibriSpeech \
+    --batch_size 16 \
+    --num_workers 8 \
+    --language en \
+    --metric wer \
+    --max_new_tokens 255 \
+    --min_audio_len 0.5 \
+    --max_audio_len 30 \
+    --local_files_only False \
+    --remove_pun True \
+    --timestamps False \
+    --result_path ./results/results_openai/whisper-base.jsonl

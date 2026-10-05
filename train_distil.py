@@ -4,6 +4,7 @@ Example::
 
     python train_distil.py --teacher_model openai/whisper-small --lambda 0.5
     python train_distil.py --teacher_model openai/whisper-large-v2 --student_model openai/whisper-small
+    torchrun --standalone --nproc_per_node=2 train_distil.py --teacher_model openai/whisper-large-v2 --student_model openai/whisper-small
 
 Loss = lambda * student_cross_entropy + (1 - lambda) * temperature_scaled_KL.
 
@@ -11,12 +12,15 @@ Without --student_model, the local Transformer is initialized randomly.
 With --student_model, load pretrained weights and auto-detect the architecture.
 Teacher/student token-ID mappings and Mel feature dimensions must match.
 Use --resume_from_checkpoint to restore Trainer/optimizer/scheduler state.
+Multi-GPU training uses torchrun/DDP: one frozen teacher and student per GPU.
+Batch sizes are per GPU; effective batch = batch * accumulation * world size.
 """
 
 import argparse
 import functools
 import os
 import platform
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -51,6 +55,10 @@ class DistillationTrainer(Seq2SeqTrainer):
         if not 0 <= loss_lambda <= 1 or temperature <= 0:
             raise ValueError("Require 0 <= loss_lambda <= 1 and temperature > 0")
         super().__init__(*args, **kwargs)
+        if self.args.n_gpu > 1:
+            raise ValueError(
+                "多卡蒸馏请使用 torchrun --nproc_per_node=<GPU数量> train_distil.py，"
+                "不要使用单进程 DataParallel；每个进程需要独立的教师模型。")
         # Each distributed process owns a frozen teacher on its training device.
         self.teacher_model = teacher_model.to(self.args.device).eval()
         self.teacher_model.requires_grad_(False)
@@ -79,6 +87,10 @@ class DistillationTrainer(Seq2SeqTrainer):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--local-rank", "--local_rank", dest="local_rank", type=int,
+        default=int(os.environ.get("LOCAL_RANK", -1)),
+        help="torchrun 进程的本地 GPU 编号，通常由 LOCAL_RANK 自动设置")
     add = functools.partial(add_arguments, argparser=parser)
     for name, default, help_text in [
         ("train_data", "dataset/train.json", "训练数据列表"),
@@ -130,6 +142,21 @@ def parse_args(argv=None):
     if platform.system() == "Windows":
         args.num_workers = 0
     return args
+
+
+def setup_distributed_device(args):
+    """Bind this worker before loading models; Trainer initializes DDP itself."""
+    # Environment takes priority, including when resuming with torchrun.
+    local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
+    if local_rank >= 0:
+        os.environ["LOCAL_RANK"] = str(local_rank)
+        if torch.cuda.is_available():
+            if local_rank >= torch.cuda.device_count():
+                raise ValueError(
+                    f"LOCAL_RANK={local_rank} 超出可见 GPU 数量；"
+                    "请检查 CUDA_VISIBLE_DEVICES 和 --nproc_per_node")
+            torch.cuda.set_device(local_rank)
+    args.local_rank = local_rank
 
 
 def build_student(args, teacher_config, processor):
@@ -195,7 +222,10 @@ def build_student(args, teacher_config, processor):
 
 def main(argv=None):
     args = parse_args(argv)
-    print_arguments(args)
+    setup_distributed_device(args)
+    is_main_process = int(os.environ.get("RANK", 0)) == 0
+    if is_main_process:
+        print_arguments(args)
     set_seed(args.seed)
     # Keep data/audio dependencies out of the CLI and loss-only imports.
     from utils.data_utils import DataCollatorSpeechSeq2SeqWithPadding
@@ -215,6 +245,9 @@ def main(argv=None):
     student = build_student(args, teacher.config, processor)
     datasets = []
     for path, augment in [(args.train_data, args.augment_config_path), (args.test_data, None)]:
+        if Path(path).is_dir():
+            # All ranks must see the same sample order before sharding.
+            path = [str(x) for x in sorted(Path(path).glob("*.json"))]
         dataset = CustomDataset(
             data_list_path=path, processor=processor, language=args.language,
             timestamps=args.timestamps, min_duration=args.min_audio_len,
@@ -222,11 +255,17 @@ def main(argv=None):
         if not len(dataset):
             raise ValueError(f"数据集为空，请检查路径及过滤条件：{path}")
         datasets.append(dataset)
-    print(f"训练数据：{len(datasets[0])}，验证数据：{len(datasets[1])}")
-    print(f"学生架构：{student.config.model_type}，"
-          f"学生参数：{sum(p.numel() for p in student.parameters()):,}")
+    if is_main_process:
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        effective_batch = (args.per_device_train_batch_size
+                           * args.gradient_accumulation_steps * world_size)
+        print(f"训练数据：{len(datasets[0])}，验证数据：{len(datasets[1])}")
+        print(f"学生架构：{student.config.model_type}，"
+              f"学生参数：{sum(p.numel() for p in student.parameters()):,}")
+        print(f"训练进程数：{world_size}，有效全局 batch size：{effective_batch}")
     training_args = Seq2SeqTrainingArguments(
         output_dir=args.output_dir,
+        local_rank=args.local_rank,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
